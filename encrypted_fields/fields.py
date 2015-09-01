@@ -6,6 +6,7 @@ from django.db import models
 from django.conf import settings
 from django.core.exceptions import ImproperlyConfigured
 from django.utils.functional import cached_property
+from keyczar.keyczar import _Session
 
 try:
     from django.utils.encoding import smart_text
@@ -24,6 +25,17 @@ class EncryptedFieldException(Exception):
 class KeyczarWrapper(object):
     def __init__(self, keyname, *args, **kwargs):
         self.crypter = keyczar.Crypter.Read(keyname)
+
+    def encrypt(self, cleartext):
+        return self.crypter.Encrypt(cleartext)
+
+    def decrypt(self, ciphertext):
+        return self.crypter.Decrypt(ciphertext)
+
+
+class KeyczarSessionWrapper(object):
+    def __init__(self, session, *args, **kwargs):
+        self.crypter = session.crypter
 
     def encrypt(self, cleartext):
         return self.crypter.Encrypt(cleartext)
@@ -240,6 +252,32 @@ class EncryptedEmailField(EncryptedFieldMixin, models.EmailField):
 class EncryptedBooleanField(EncryptedFieldMixin, models.BooleanField):
     pass
 
+
+class ObjectEncryptedModelMixin(object):
+    _session = EncryptedTextField(null=True, blank=True)
+
+    def __init__(self, *args, **kwargs):
+        pass
+
+
+class ObjectEncryptedFieldMixin(EncryptedFieldMixin):
+    __metaclass__ = models.SubfieldBase
+
+    def __init__(self, *args, **kwargs):
+        # FIXME: this creates a new Session per field, not per user
+        self._session = _Session.New()
+        # self._crypter_klass = KeyczarSessionWrapper(session=self._session)
+
+        super(ObjectEncryptedFieldMixin, self).__init__(*args, **kwargs)
+
+    def crypter(self):
+        # somehow return the crypter of the Session of the user (or object)
+        # FIXME: this  a Session per field, not per user
+        return KeyczarSessionWrapper(session=self._session)
+
+
+class ObjectEncryptedTextField(ObjectEncryptedFieldMixin, models.TextField):
+    pass
 
 try:
     from south.modelsinspector import add_introspection_rules

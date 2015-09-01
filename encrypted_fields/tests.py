@@ -6,6 +6,8 @@ import unittest
 import django
 from django.conf import settings
 from django.db import models, connection
+from django.db.models import OneToOneField, TextField, ForeignKey
+from django.forms import CharField
 from django.test import TestCase
 from django.utils import timezone
 
@@ -18,7 +20,7 @@ from .fields import (
     EncryptedFloatField,
     EncryptedEmailField,
     EncryptedBooleanField,
-)
+    ObjectEncryptedTextField)
 
 from keyczar import keyczar, readers
 
@@ -37,6 +39,15 @@ class TestCrypter(object):
         return self.crypter.Decrypt(ciphertext)
 
 
+class TestUserModel(models.Model):
+    username = CharField(max_length=32)
+
+
+class TestUserSessionModel(models.Model):
+    user = OneToOneField(TestUserModel, )
+    material = EncryptedTextField(null=True, blank=True)
+
+
 class TestModel(models.Model):
     char = EncryptedCharField(max_length=255, null=True, blank=True)
     prefix_char = EncryptedCharField(max_length=255, prefix='ENCRYPTED:::', blank=True)
@@ -51,6 +62,9 @@ class TestModel(models.Model):
     floating = EncryptedFloatField(null=True, blank=True)
     email = EncryptedEmailField(null=True, blank=True)
     boolean = EncryptedBooleanField(default=False, blank=True)
+
+    obj_text = ObjectEncryptedTextField(null=True, blank=True)
+    # obj_text_obj = ForeignKey(TestUserSessionModel)
 
     char_custom_crypter = EncryptedCharField(
         max_length=255, null=True,crypter_klass=TestCrypter, blank=True)
@@ -283,3 +297,26 @@ class FieldTest(TestCase):
 
         fresh_model = TestModel.objects.get(id=obj.id)
         self.assertEqual(fresh_model.integer, plainint)
+
+    def test_text_field_object_encrypted(self):
+        plaintext = 'Oh hi, test reader!' * 10
+
+        # user = TestUserModel(username="Anon")
+        # user.save()
+        #
+        # session = TestUserSessionModel(user=user)
+        # session.save()
+
+        model = TestModel()
+        model.obj_text = plaintext
+        model.save()
+
+        ciphertext = self.get_db_value('obj_text', model.id)
+
+        self.assertNotEqual(plaintext, ciphertext)
+        self.assertTrue('test' not in ciphertext)
+
+        fresh_model = TestModel.objects.get(id=model.id)
+        self.assertEqual(fresh_model.obj_text, plaintext)
+
+        # TODO test loading data saved in this way after a restart. Should still work. This confirms
