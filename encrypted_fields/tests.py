@@ -20,7 +20,7 @@ from .fields import (
     EncryptedFloatField,
     EncryptedEmailField,
     EncryptedBooleanField,
-    ObjectEncryptedTextField)
+    SessionEncryptedTextField, SessionEncryptedModel)
 
 from keyczar import keyczar, readers
 
@@ -39,15 +39,6 @@ class TestCrypter(object):
         return self.crypter.Decrypt(ciphertext)
 
 
-class TestUserModel(models.Model):
-    username = CharField(max_length=32)
-
-
-class TestUserSessionModel(models.Model):
-    user = OneToOneField(TestUserModel, )
-    material = EncryptedTextField(null=True, blank=True)
-
-
 class TestModel(models.Model):
     char = EncryptedCharField(max_length=255, null=True, blank=True)
     prefix_char = EncryptedCharField(max_length=255, prefix='ENCRYPTED:::', blank=True)
@@ -62,9 +53,6 @@ class TestModel(models.Model):
     floating = EncryptedFloatField(null=True, blank=True)
     email = EncryptedEmailField(null=True, blank=True)
     boolean = EncryptedBooleanField(default=False, blank=True)
-
-    obj_text = ObjectEncryptedTextField(null=True, blank=True)
-    # obj_text_obj = ForeignKey(TestUserSessionModel)
 
     char_custom_crypter = EncryptedCharField(
         max_length=255, null=True,crypter_klass=TestCrypter, blank=True)
@@ -298,6 +286,23 @@ class FieldTest(TestCase):
         fresh_model = TestModel.objects.get(id=obj.id)
         self.assertEqual(fresh_model.integer, plainint)
 
+
+class SessionTestModel(SessionEncryptedModel):
+    text = SessionEncryptedTextField(null=True, blank=True)
+
+
+class SessionFieldTest(TestCase):
+    IS_POSTGRES = settings.DATABASES['default']['ENGINE'] == 'django.db.backends.postgresql_psycopg2'
+
+    def get_db_value(self, field, model_id):
+        cursor = connection.cursor()
+        cursor.execute(
+            'select {0} '
+            'from encrypted_fields_sessiontestmodel '
+            'where id = {1};'.format(field, model_id)
+        )
+        return cursor.fetchone()[0]
+
     def test_text_field_object_encrypted(self):
         plaintext = 'Oh hi, test reader!' * 10
 
@@ -307,16 +312,20 @@ class FieldTest(TestCase):
         # session = TestUserSessionModel(user=user)
         # session.save()
 
-        model = TestModel()
-        model.obj_text = plaintext
+        model = SessionTestModel()
+        model.text = plaintext
         model.save()
 
-        ciphertext = self.get_db_value('obj_text', model.id)
+        ciphertext = self.get_db_value('text', model.id)
 
         self.assertNotEqual(plaintext, ciphertext)
         self.assertTrue('test' not in ciphertext)
 
-        fresh_model = TestModel.objects.get(id=model.id)
-        self.assertEqual(fresh_model.obj_text, plaintext)
+        cipher_session = self.get_db_value('_session', model.id)
+        self.assertTrue('nonce' not in cipher_session)
 
-        # TODO test loading data saved in this way after a restart. Should still work. This confirms
+        fresh_model = SessionTestModel.objects.get(id=model.id)
+        self.assertEqual(model.session.nonce, fresh_model.session.nonce)
+        self.assertEqual(fresh_model.text, plaintext)
+
+        # TODO test loading data saved in this way after a restart. Should still work. This confirms that session is saved.

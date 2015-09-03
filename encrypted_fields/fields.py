@@ -253,30 +253,256 @@ class EncryptedBooleanField(EncryptedFieldMixin, models.BooleanField):
     pass
 
 
-class ObjectEncryptedModelMixin(object):
-    _session = EncryptedTextField(null=True, blank=True)
+class ObjectEncryptedError(Exception):
+    pass
+
+
+class SessionEncryptedModel(models.Model):
+    _session = EncryptedTextField(null=True, blank=True, default=_Session.New().json)
 
     def __init__(self, *args, **kwargs):
-        pass
+        super(SessionEncryptedModel, self).__init__(*args, **kwargs)
+
+    # FIXME: optimise so not constantly converting from JSON
+    @property
+    def session(self):
+        return _Session.LoadJsonSession(self._session)
+
+    @classmethod
+    def from_db(cls, db, field_names, values):
+        instance = super(SessionEncryptedModel, cls).from_db(db, field_names, values)
+        for field in instance._meta.fields:
+            if isinstance(field, SessionEncryptedFieldMixin):
+                decrypted_value = field.to_python_with_sesion(getattr(instance, field.attname), instance.session)
+                setattr(instance, field.attname, decrypted_value)
+
+        return instance
+
+    class Meta:
+        abstract = True
 
 
-class ObjectEncryptedFieldMixin(EncryptedFieldMixin):
+class SessionEncryptedFieldMixin(object):
+    """
+    EncryptedFieldMixin will use keyczar to encrypt/decrypt data that is being
+    marshalled in/out of the database into application Django model fields.
+
+    This is very helpful in ensuring that data at rest is encrypted and
+    minimizing the effects of SQL Injection or insider access to sensitive
+    databases containing sensitive information.
+
+    The most basic use of this mixin is to have a single encryption key for all
+    data in your database. This lives in a Keyczar key directory specified by:
+    the setting - settings.ENCRYPTED_FIELDS_KEYDIR -
+
+    Optionally, you can name specific encryption keys for data-specific purposes
+    in your model such as:
+        special_data = EncrytpedCharField( ..., keyname='special_data' )
+
+    The Mixin will handle the encryption/decryption seamlessly, but native
+    SQL queries may need a way to filter data that is encrypted. Using the
+    optional 'prefix' kwarg will prepend a static identifier to your encrypted
+    data before it is written to the database.
+
+    There are other use cases where you may not wish to encrypt all of the data
+    in a database. For example, if you have a survey application that allows
+    users to enter arbitrary questions and answers, users may request sensitive
+    information to be stored such as SSN, Driver License #, Credit Card, etc.
+    Your application can detect these sensitive fields, manually encrypt the
+    data and store that in the database mixed with other cleartext data.
+    The model should then only decrypt the specific fields needed. Use the
+    kwarg 'decrypt_only' to specify this behavior and the model will not
+    encrypt the data inbound and only attempt to decrypt outbound.
+
+    Encrypting data will significantly change the size of the data being stored
+    and this may cause issues with your database column size. Before storing
+    any encrypted data in your database, ensure that you have the proper
+    column width otherwise you may experience truncation of your data depending
+    on the database engine in use.
+
+    To have the mixin enforce max field length, either:
+        a) set ENFORCE_MAX_LENGTH = True in your settings files
+        b) set 'enforce_max_length' to True in the kwargs of your model.
+
+    A ValueError will be raised if the encrypted length of the data (including
+    prefix if specified) is greater than the max_length of the field.
+    """
     __metaclass__ = models.SubfieldBase
 
     def __init__(self, *args, **kwargs):
-        # FIXME: this creates a new Session per field, not per user
-        self._session = _Session.New()
-        # self._crypter_klass = KeyczarSessionWrapper(session=self._session)
+        """
+        Initialize the EncryptedFieldMixin with the following
+        optional settings:
+        * keyname: The name of the keyczar key
+        * crypter_klass: A custom class that is extended from Keyczar.
+        * prefix: A static string prepended to all encrypted data
+        * decrypt_only: Boolean whether to only attempt to decrypt data coming
+                        from the database and not attempt to encrypt the data
+                        being written to the database.
+        """
+        # Allow for custom class extensions of Keyczar.
+        self._crypter_klass = kwargs.pop('crypter_klass', KeyczarWrapper)
 
-        super(ObjectEncryptedFieldMixin, self).__init__(*args, **kwargs)
+        self.keyname = kwargs.pop('keyname', None)
+
+        # If settings.DEFAULT_KEY_DIRECTORY, then the key
+        # is located in DEFAULT_KEY_DIRECTORY/keyname
+        if self.keyname:
+            if hasattr(settings, 'DEFAULT_KEY_DIRECTORY'):
+                self.keydir = os.path.join(
+                    settings.DEFAULT_KEY_DIRECTORY,
+                    self.keyname
+                )
+            else:
+                raise ImproperlyConfigured(
+                    'You must set settings.DEFAULT_KEY_DIRECTORY'
+                    'when using the keyname kwarg'
+                )
+
+        # If the keyname is not defined on a per-field
+        # basis, then check for the global data encryption key.
+        if not self.keyname and hasattr(settings, 'ENCRYPTED_FIELDS_KEYDIR'):
+            self.keydir = settings.ENCRYPTED_FIELDS_KEYDIR
+
+        # If we still do not have a keydir, then raise an exception
+        if not self.keydir:
+            raise ImproperlyConfigured(
+                'You must set settings.ENCRYPTED_FIELDS_KEYDIR '
+                'or name a key with kwarg `keyname`'
+            )
+
+        # The name of the keyczar key without path for logging purposes.
+        self.keyname = os.path.dirname(self.keydir)
+
+        # Prefix encrypted data with a static string to allow filtering
+        # of encrypted data vs. non-encrypted data using vanilla MySQL queries.
+        self.prefix = kwargs.pop('prefix', '')
+
+        # Allow for model decryption-only, bypassing encryption of data.
+        # Useful for models that have a sparse amount of data that is required
+        # to be encrypted.
+        self.decrypt_only = kwargs.pop('decrypt_only', False)
+
+        self._crypter = self._crypter_klass(self.keydir)
+
+        # Ensure the encrypted data does not exceed the max_length
+        # of the database. Data truncation is a possibility otherwise.
+        self.enforce_max_length = getattr(settings, 'ENFORCE_MAX_LENGTH', False)
+        if not self.enforce_max_length:
+            self.enforce_max_length = kwargs.pop('enforce_max_length', False)
+
+        super(SessionEncryptedFieldMixin, self).__init__(*args, **kwargs)
 
     def crypter(self):
-        # somehow return the crypter of the Session of the user (or object)
-        # FIXME: this  a Session per field, not per user
-        return KeyczarSessionWrapper(session=self._session)
+        return self._crypter
+
+    def get_internal_type(self):
+        return 'TextField'
+
+    def session_crypter(self, session):
+        # return the crypter of the Session of the user (or object)
+        return KeyczarSessionWrapper(session=session)
+
+    def to_python_with_sesion(self, value, session):
+        if value is None or not isinstance(value, types.StringTypes):
+            return value
+
+        if self.prefix and value.startswith(self.prefix):
+            value = value[len(self.prefix):]
+
+        try:
+            value = self.session_crypter(session).decrypt(value)
+            value = value.decode('unicode_escape')
+        except keyczar.errors.KeyczarError:
+            pass
+        except UnicodeEncodeError:
+            pass
+
+        return super(SessionEncryptedFieldMixin, self).to_python(value)
+
+    # def from_db_value(self, value, expression, connection, context):
+    #     if value is None or not isinstance(value, types.StringTypes):
+    #         return value
+    #
+    #     if self.prefix and value.startswith(self.prefix):
+    #         value = value[len(self.prefix):]
+    #
+    #     try:
+    #         value = self.crypter().decrypt(value)
+    #         value = value.decode('unicode_escape')
+    #     except keyczar.errors.KeyczarError:
+    #         pass
+    #     except UnicodeEncodeError:
+    #         pass
+    #
+    #     return super(SessionEncryptedFieldMixin, self).from_db_value(value, expression, connection, context)
+
+    def to_python(self, value):
+        if value is None or not isinstance(value, types.StringTypes):
+            return value
+
+        if self.prefix and value.startswith(self.prefix):
+            value = value[len(self.prefix):]
+
+        try:
+            # FIXME to work with session!
+            value = self.crypter().decrypt(value)
+            value = value.decode('unicode_escape')
+        except keyczar.errors.KeyczarError:
+            pass
+        except UnicodeEncodeError:
+            pass
+
+        return super(SessionEncryptedFieldMixin, self).to_python(value)
+
+    def get_prep_value(self, value):
+        (session, value) = value  # Requires that session has been added to value by pre_save
+        value = super(SessionEncryptedFieldMixin, self).get_prep_value(value)
+
+        if value is None or value == '' or self.decrypt_only:
+            return value
+
+        if isinstance(value, types.StringTypes):
+            value = value.encode('unicode_escape')
+            value = value.encode('ascii')
+        else:
+            value = str(value)
+
+        return self.prefix + self.session_crypter(session).encrypt(value)
+
+    def get_db_prep_save(self, value, connection):
+        return self.get_db_prep_value(value, connection, prepared=False)
+
+    def get_db_prep_value(self, value, connection, prepared=False):
+        if not prepared:
+            value = self.get_prep_value(value)
+
+            if self.enforce_max_length:
+                if (
+                    value
+                    and hasattr(self, 'max_length')
+                    and self.max_length
+                    and len(value) > self.max_length
+                ):
+                    raise ValueError(
+                        'Field {0} max_length={1} encrypted_len={2}'.format(
+                            self.name,
+                            self.max_length,
+                            len(value),
+                        )
+                    )
+        return value
+
+    # Called prior to get_db_prep_save()
+    # could turn the model value into an instance-specific (session, value) tuple
+    def pre_save(self, model_instance, add):
+        if hasattr(model_instance, 'session'):
+            return model_instance.session, getattr(model_instance, self.attname)
+        else:
+            raise ObjectEncryptedError("Model instance does not have session material.")
 
 
-class ObjectEncryptedTextField(ObjectEncryptedFieldMixin, models.TextField):
+class SessionEncryptedTextField(SessionEncryptedFieldMixin, models.TextField):
     pass
 
 try:
